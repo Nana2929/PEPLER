@@ -1,19 +1,46 @@
-import os
-import re
-import math
-import torch
-import random
-import pickle
 import datetime
-from rouge import rouge
+import math
+import os
+import pickle
+import random
+import re
+
+import torch
+from nltk.stem import WordNetLemmatizer
+
 from bleu import compute_bleu
+from rouge import rouge
+
+
+def evaluate_precision_recall_f1(
+    top_k, user2items_test, user2items_top
+):  # (B, pos_num)  (B, k)
+    precision_sum = 0
+    recall_sum = 0
+    f1_sum = 0
+    for i in range(len(user2items_test)):
+        rank_list = user2items_top[i]
+        test_list = user2items_test[i]
+        hits = len(set(test_list) & set(rank_list))
+        pre = hits / top_k
+        rec = hits / len(test_list)
+        precision_sum += pre
+        recall_sum += rec
+        if (pre + rec) > 0:
+            f1_sum += 2 * pre * rec / (pre + rec)
+
+    precision = precision_sum / len(user2items_test)
+    recall = recall_sum / len(user2items_test)
+    f1 = f1_sum / len(user2items_test)
+
+    return precision, recall, f1
 
 
 def rouge_score(references, generated):
     """both are a list of strings"""
     score = rouge(generated, references)
     rouge_s = {k: (v * 100) for (k, v) in score.items()}
-    '''
+    """
     "rouge_1/f_score": rouge_1_f,
     "rouge_1/r_score": rouge_1_r,
     "rouge_1/p_score": rouge_1_p,
@@ -23,7 +50,7 @@ def rouge_score(references, generated):
     "rouge_l/f_score": rouge_l_f,
     "rouge_l/r_score": rouge_l_r,
     "rouge_l/p_score": rouge_l_p,
-    '''
+    """
     return rouge_s
 
 
@@ -37,7 +64,7 @@ def bleu_score(references, generated, n_gram=4, smooth=False):
 def two_seq_same(sa, sb):
     if len(sa) != len(sb):
         return False
-    for (wa, wb) in zip(sa, sb):
+    for wa, wb in zip(sa, sb):
         if wa != wb:
             return False
     return True
@@ -57,13 +84,20 @@ def unique_sentence_percent(sequence_batch):
     return len(unique_seq) / len(sequence_batch), len(unique_seq)
 
 
+def getstem(word, lemmatizer=None):
+    return lemmatizer.lemmatize(word)
+
+
 def feature_detect(seq_batch, feature_set):
+    lemmatizer = WordNetLemmatizer()
     feature_batch = []
     for ids in seq_batch:
         feature_list = []
         for i in ids:
+            i = getstem(i, lemmatizer)
             if i in feature_set:
                 feature_list.append(i)
+
         feature_batch.append(set(feature_list))
 
     return feature_batch
@@ -71,10 +105,15 @@ def feature_detect(seq_batch, feature_set):
 
 def feature_matching_ratio(feature_batch, test_feature):
     count = 0
-    for (fea_set, fea) in zip(feature_batch, test_feature):
-        if fea in fea_set:
-            count += 1
+    for fea_set, fea in zip(feature_batch, test_feature):
+        if isinstance(fea, list):
+            for f in fea:  # a list of features
+                if f in fea_set:
+                    count += 1
 
+        else:  # single feature
+            if fea in fea_set:
+                count += 1
     return count / len(feature_batch)
 
 
@@ -101,17 +140,14 @@ def feature_diversity(feature_batch):
 
 def mean_absolute_error(predicted, max_r, min_r, mae=True):
     total = 0
-    for (r, p) in predicted:
-        if p > max_r:
-            p = max_r
-        if p < min_r:
-            p = min_r
-
+    for r, p in predicted:
+        p = max(p, max_r)
+        p = min(p, min_r)
         sub = p - r
         if mae:
             total += abs(sub)
         else:
-            total += sub ** 2
+            total += sub**2
 
     return total / len(predicted)
 
@@ -139,21 +175,23 @@ class DataLoader:
     def __init__(self, data_path, index_dir, tokenizer, seq_len):
         self.user_dict = EntityDictionary()
         self.item_dict = EntityDictionary()
-        self.max_rating = float('-inf')
-        self.min_rating = float('inf')
+        self.max_rating = float("-inf")
+        self.min_rating = float("inf")
         self.initialize(data_path)
         self.feature_set = set()
         self.tokenizer = tokenizer
         self.seq_len = seq_len
-        self.train, self.valid, self.test, self.user2feature, self.item2feature = self.load_data(data_path, index_dir)
+        self.train, self.valid, self.test, self.user2feature, self.item2feature = (
+            self.load_data(data_path, index_dir)
+        )
 
     def initialize(self, data_path):
         assert os.path.exists(data_path)
-        reviews = pickle.load(open(data_path, 'rb'))
+        reviews = pickle.load(open(data_path, "rb"))
         for review in reviews:
-            self.user_dict.add_entity(review['user'])
-            self.item_dict.add_entity(review['item'])
-            rating = review['rating']
+            self.user_dict.add_entity(review["user"])
+            self.item_dict.add_entity(review["item"])
+            rating = review["rating"]
             if self.max_rating < rating:
                 self.max_rating = rating
             if self.min_rating > rating:
@@ -161,27 +199,51 @@ class DataLoader:
 
     def load_data(self, data_path, index_dir):
         data = []
-        reviews = pickle.load(open(data_path, 'rb'))
+        reviews = pickle.load(open(data_path, "rb"))
         for review in reviews:
-            (fea, adj, tem, sco) = review['template']
-            tokens = self.tokenizer(tem)['input_ids']
-            text = self.tokenizer.decode(tokens[:self.seq_len])  # keep seq_len tokens at most
-            data.append({'user': self.user_dict.entity2idx[review['user']],
-                         'item': self.item_dict.entity2idx[review['item']],
-                         'rating': review['rating'],
-                         'text': text,
-                         'feature': fea})
-            self.feature_set.add(fea)
+            try:
+                (fea, adj, tem, sco) = review["template"]
+            except:
+                (fea, adj, tem, sco, cat) = review["template"]
+            tokens = self.tokenizer(tem)["input_ids"]
+            text = self.tokenizer.decode(
+                tokens[: self.seq_len]
+            )  # keep seq_len tokens at most
+            data.append(
+                {
+                    "user": self.user_dict.entity2idx[review["user"]],
+                    "item": self.item_dict.entity2idx[review["item"]],
+                    "user_id": review["user"],
+                    "item_id": review["item"],
+                    "category": cat,
+                    "rating": review["rating"],
+                    "text": text,
+                    "feature": fea,
+                }
+            )
+            if isinstance(fea, str):
+                self.feature_set.add(fea)
+            elif isinstance(fea, list):
+                self.feature_set.update(set(fea))
+            else:
+                raise ValueError("feature type not supported")
 
         train_index, valid_index, test_index = self.load_index(index_dir)
         train, valid, test = [], [], []
         user2feature, item2feature = {}, {}
+
+        # add empty list for users and items without features
+        other_index = test_index + valid_index
+        for idx in other_index:
+            user2feature[data[idx]["user"]] = []
+            item2feature[data[idx]["item"]] = []
+
         for idx in train_index:
             review = data[idx]
             train.append(review)
-            u = review['user']
-            i = review['item']
-            f = review['feature']
+            u = review["user"]
+            i = review["item"]
+            f = review["feature"]
             if u in user2feature:
                 user2feature[u].append(f)
             else:
@@ -198,12 +260,12 @@ class DataLoader:
 
     def load_index(self, index_dir):
         assert os.path.exists(index_dir)
-        with open(os.path.join(index_dir, 'train.index'), 'r') as f:
-            train_index = [int(x) for x in f.readline().split(' ')]
-        with open(os.path.join(index_dir, 'validation.index'), 'r') as f:
-            valid_index = [int(x) for x in f.readline().split(' ')]
-        with open(os.path.join(index_dir, 'test.index'), 'r') as f:
-            test_index = [int(x) for x in f.readline().split(' ')]
+        with open(os.path.join(index_dir, "train.index"), "r") as f:
+            train_index = [int(x) for x in f.readline().split(" ")]
+        with open(os.path.join(index_dir, "validation.index"), "r") as f:
+            valid_index = [int(x) for x in f.readline().split(" ")]
+        with open(os.path.join(index_dir, "test.index"), "r") as f:
+            test_index = [int(x) for x in f.readline().split(" ")]
         return train_index, valid_index, test_index
 
 
@@ -211,15 +273,15 @@ class Batchify:
     def __init__(self, data, tokenizer, bos, eos, batch_size=128, shuffle=False):
         u, i, r, t, self.feature = [], [], [], [], []
         for x in data:
-            u.append(x['user'])
-            i.append(x['item'])
-            r.append(x['rating'])
-            t.append('{} {} {}'.format(bos, x['text'], eos))
-            self.feature.append(x['feature'])
+            u.append(x["user"])
+            i.append(x["item"])
+            r.append(x["rating"])
+            t.append("{} {} {}".format(bos, x["text"], eos))
+            self.feature.append(x["feature"])
 
-        encoded_inputs = tokenizer(t, padding=True, return_tensors='pt')
-        self.seq = encoded_inputs['input_ids'].contiguous()
-        self.mask = encoded_inputs['attention_mask'].contiguous()
+        encoded_inputs = tokenizer(t, padding=True, return_tensors="pt")
+        self.seq = encoded_inputs["input_ids"].contiguous()
+        self.mask = encoded_inputs["attention_mask"].contiguous()
         self.user = torch.tensor(u, dtype=torch.int64).contiguous()
         self.item = torch.tensor(i, dtype=torch.int64).contiguous()
         self.rating = torch.tensor(r, dtype=torch.float).contiguous()
@@ -249,22 +311,41 @@ class Batchify:
 
 
 class Batchify2:
-    def __init__(self, data, user2feature, item2feature, tokenizer, bos, eos, seq_len, batch_size=128, shuffle=False):
+    def __init__(
+        self,
+        data,
+        user2feature,
+        item2feature,
+        tokenizer,
+        bos,
+        eos,
+        seq_len,
+        batch_size=128,
+        shuffle=False,
+    ):
         t, self.feature, features = [], [], []
         for x in data:
-            ufea = set(user2feature[x['user']])
-            ifea = set(item2feature[x['item']])
+            try:
+                ufea = set(user2feature[x["user"]])
+                ifea = set(item2feature[x["item"]])
+            except:
+                ufea = user2feature[x["user"]]
+                ifea = item2feature[x["item"]]
+                # extend each element in the list to set
+                ufea = set([f for fea in ufea for f in fea])
+                ifea = set([f for fea in ifea for f in fea])
+
             intersection = ufea & ifea
             difference = ufea | ifea - intersection
-            features.append(' '.join(list(intersection) + list(difference)))
-            t.append('{} {} {}'.format(bos, x['text'], eos))
-            self.feature.append(x['feature'])
+            features.append(" ".join(list(intersection) + list(difference)))
+            t.append("{} {} {}".format(bos, x["text"], eos))
+            self.feature.append(x["feature"])
 
-        encoded_inputs = tokenizer(t, padding=True, return_tensors='pt')
-        self.seq = encoded_inputs['input_ids'].contiguous()
-        self.mask = encoded_inputs['attention_mask'].contiguous()
-        encoded_features = tokenizer(features, padding=True, return_tensors='pt')
-        self.prompt = encoded_features['input_ids'][:, :seq_len].contiguous()
+        encoded_inputs = tokenizer(t, padding=True, return_tensors="pt")
+        self.seq = encoded_inputs["input_ids"].contiguous()
+        self.mask = encoded_inputs["attention_mask"].contiguous()
+        encoded_features = tokenizer(features, padding=True, return_tensors="pt")
+        self.prompt = encoded_features["input_ids"][:, :seq_len].contiguous()
         self.shuffle = shuffle
         self.batch_size = batch_size
         self.sample_num = len(data)
@@ -289,29 +370,29 @@ class Batchify2:
 
 
 def now_time():
-    return '[' + datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f') + ']: '
+    return "[" + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f") + "]: "
 
 
 def postprocessing(string):
-    '''
+    """
     adopted from https://github.com/yoonkim/CNN_sentence/blob/master/process_data.py
-    '''
-    string = re.sub('\'s', ' \'s', string)
-    string = re.sub('\'m', ' \'m', string)
-    string = re.sub('\'ve', ' \'ve', string)
-    string = re.sub('n\'t', ' n\'t', string)
-    string = re.sub('\'re', ' \'re', string)
-    string = re.sub('\'d', ' \'d', string)
-    string = re.sub('\'ll', ' \'ll', string)
-    string = re.sub('\(', ' ( ', string)
-    string = re.sub('\)', ' ) ', string)
-    string = re.sub(',+', ' , ', string)
-    string = re.sub(':+', ' , ', string)
-    string = re.sub(';+', ' . ', string)
-    string = re.sub('\.+', ' . ', string)
-    string = re.sub('!+', ' ! ', string)
-    string = re.sub('\?+', ' ? ', string)
-    string = re.sub(' +', ' ', string).strip()
+    """
+    string = re.sub("'s", " 's", string)
+    string = re.sub("'m", " 'm", string)
+    string = re.sub("'ve", " 've", string)
+    string = re.sub("n't", " n't", string)
+    string = re.sub("'re", " 're", string)
+    string = re.sub("'d", " 'd", string)
+    string = re.sub("'ll", " 'll", string)
+    string = re.sub("\(", " ( ", string)
+    string = re.sub("\)", " ) ", string)
+    string = re.sub(",+", " , ", string)
+    string = re.sub(":+", " , ", string)
+    string = re.sub(";+", " . ", string)
+    string = re.sub("\.+", " . ", string)
+    string = re.sub("!+", " ! ", string)
+    string = re.sub("\?+", " ? ", string)
+    string = re.sub(" +", " ", string).strip()
     return string
 
 
